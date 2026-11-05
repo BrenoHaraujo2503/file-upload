@@ -6,6 +6,7 @@ type UploadFile = {
   error?: string;
   progress: number; // 0–100
   uploading: boolean;
+  url?: string;
 };
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
@@ -20,6 +21,7 @@ export function App() {
   const inputRef = useRef<HTMLInputElement>(null);
   const [files, setFiles] = useState<UploadFile[]>([]);
   const [isDragging, setIsDragging] = useState(false);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
 
   const valid = files.filter((item) => !item.error);
   const isUploading = valid.some((item) => item.uploading);
@@ -47,7 +49,16 @@ export function App() {
           if (!item.uploading) return item;
           const step = 100 / (6 + (item.file.size / 1024 / 1024) * 8);
           const progress = Math.min(100, item.progress + step * (0.7 + Math.random() * 0.6));
-          return { ...item, progress, uploading: progress < 100 };
+          const finished = progress >= 100;
+          return {
+            ...item,
+            progress,
+            uploading: !finished,
+            // Link de exemplo: troque pela URL retornada pelo seu backend.
+            url: finished
+              ? `${window.location.origin}/arquivos/${item.id}/${encodeURIComponent(item.file.name)}`
+              : item.url,
+          };
         })
       );
     }, 250);
@@ -88,6 +99,27 @@ export function App() {
     addFiles(event.dataTransfer.files);
   }
 
+  async function copyLink(id: string, url: string) {
+    try {
+      await navigator.clipboard.writeText(url);
+    } catch {
+      // Fallback para navegadores/contextos sem Clipboard API
+      const textarea = document.createElement("textarea");
+      textarea.value = url;
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand("copy");
+      document.body.removeChild(textarea);
+    }
+
+    setCopiedId(id);
+    window.setTimeout(() => {
+      setCopiedId((current) => (current === id ? null : current));
+    }, 2000);
+  }
+
   function removeFile(id: string) {
     setFiles((current) => current.filter((item) => item.id !== id));
   }
@@ -109,13 +141,23 @@ export function App() {
         <p className="mt-1 text-sm text-zinc-500">PDF, PNG ou JPG · até 10 MB</p>
 
         <div
+          role="button"
+          tabIndex={0}
+          aria-label="Selecionar arquivos"
+          onClick={() => inputRef.current?.click()}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              inputRef.current?.click();
+            }
+          }}
           onDragOver={(event) => {
             event.preventDefault();
             setIsDragging(true);
           }}
           onDragLeave={() => setIsDragging(false)}
           onDrop={handleDrop}
-          className={`mt-6 rounded-2xl border border-dashed px-6 py-10 text-center transition ${
+          className={`mt-6 cursor-pointer rounded-2xl border border-dashed px-6 py-12 text-center transition focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 ${
             isDragging
               ? "border-blue-400 bg-blue-500/10"
               : "border-zinc-700 bg-zinc-900/50 hover:border-zinc-500"
@@ -130,20 +172,26 @@ export function App() {
             onChange={handleInputChange}
           />
 
-          <p className="text-sm text-zinc-300">Arraste arquivos para cá ou</p>
-          <button
-            type="button"
-            onClick={() => inputRef.current?.click()}
-            className="mt-3 rounded-lg bg-white px-4 py-2 text-sm font-medium text-zinc-950 transition hover:bg-zinc-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950"
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            className="mx-auto h-8 w-8 text-zinc-500"
+            stroke="currentColor"
+            strokeWidth="1.8"
+            strokeLinecap="round"
+            strokeLinejoin="round"
           >
-            Escolher arquivos
-          </button>
+            <path d="M12 15V3m0 0L7.5 7.5M12 3l4.5 4.5M5 14v4.5A1.5 1.5 0 0 0 6.5 20h11a1.5 1.5 0 0 0 1.5-1.5V14" />
+          </svg>
+          <p className="mt-3 text-sm text-zinc-300">
+            {isDragging ? "Solte para adicionar" : "Clique ou arraste arquivos para cá"}
+          </p>
         </div>
 
         {files.length > 0 && (
           <>
             <ul className="mt-6 divide-y divide-white/5">
-              {files.map(({ id, file, error, progress, uploading }) => {
+              {files.map(({ id, file, error, progress, uploading, url }) => {
                 const pct = Math.floor(progress);
                 const done = progress >= 100;
 
@@ -161,14 +209,34 @@ export function App() {
                         </p>
                       </div>
 
-                      {!error && (uploading || done) && (
-                        <span
-                          className={`font-mono text-xs tabular-nums ${
-                            done ? "text-emerald-400" : "text-zinc-400"
+                      {!error && uploading && (
+                        <span className="font-mono text-xs tabular-nums text-zinc-400">
+                          {pct}%
+                        </span>
+                      )}
+
+                      {!error && done && url && (
+                        <button
+                          type="button"
+                          onClick={() => copyLink(id, url)}
+                          className={`flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium transition focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 ${
+                            copiedId === id
+                              ? "bg-emerald-500/10 text-emerald-400"
+                              : "bg-white/5 text-zinc-300 hover:bg-white/10 hover:text-white"
                           }`}
                         >
-                          {done ? "100%" : `${pct}%`}
-                        </span>
+                          {copiedId === id ? (
+                            <svg viewBox="0 0 24 24" fill="none" className="h-3.5 w-3.5" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="m5 12.5 4.5 4.5L19 7.5" />
+                            </svg>
+                          ) : (
+                            <svg viewBox="0 0 24 24" fill="none" className="h-3.5 w-3.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <rect x="9" y="9" width="11" height="11" rx="2" />
+                              <path d="M5 15V6a2 2 0 0 1 2-2h9" />
+                            </svg>
+                          )}
+                          {copiedId === id ? "Copiado!" : "Copiar link"}
+                        </button>
                       )}
 
                       <button
