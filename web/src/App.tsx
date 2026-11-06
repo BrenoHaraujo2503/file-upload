@@ -1,16 +1,19 @@
 import { type ChangeEvent, type DragEvent, useEffect, useRef, useState } from "react";
+import { Viewer } from "./components/Viewer";
 
 type UploadFile = {
   id: string;
   file: File;
   error?: string;
-  progress: number; // 0–100
+  failed?: boolean;
+  progress: number;
   uploading: boolean;
   url?: string;
 };
 
-const MAX_FILE_SIZE = 10 * 1024 * 1024;
-const ACCEPTED_TYPES = ["application/pdf", "image/png", "image/jpeg"];
+const API_URL: string = import.meta.env.VITE_API_URL ?? "http://localhost:3333";
+const MAX_FILE_SIZE = 100 * 1024 * 1024;
+const ACCEPTED_TYPES = ["application/pdf", "image/png", "image/jpeg", "video/mp4"];
 
 function formatFileSize(bytes: number) {
   if (bytes < 1024 * 1024) return `${Math.ceil(bytes / 1024)} KB`;
@@ -18,14 +21,23 @@ function formatFileSize(bytes: number) {
 }
 
 export function App() {
+  const match = window.location.pathname.match(/^\/([^/]+)\/?$/);
+  if (match) return <Viewer id={decodeURIComponent(match[1])} apiUrl={API_URL} />;
+  return <Uploader />;
+}
+
+function Uploader() {
   const inputRef = useRef<HTMLInputElement>(null);
+  const xhrs = useRef<Map<string, XMLHttpRequest>>(new Map());
   const [files, setFiles] = useState<UploadFile[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
   const valid = files.filter((item) => !item.error);
+  const pending = valid.filter((item) => item.progress < 100);
   const isUploading = valid.some((item) => item.uploading);
-  const allDone = valid.length > 0 && valid.every((item) => item.progress >= 100);
+  const hasFailed = valid.some((item) => item.failed);
+  const allDone = valid.length > 0 && pending.length === 0;
 
   const totalBytes = valid.reduce((sum, item) => sum + item.file.size, 0);
   const loadedBytes = valid.reduce(
@@ -38,33 +50,17 @@ export function App() {
       ? 0
       : Math.min(99, Math.floor((loadedBytes / totalBytes) * 100));
 
-  // Envio SIMULADO. Para envio real, troque este efeito por um XMLHttpRequest
-  // e atualize `progress` em `xhr.upload.onprogress` (loaded / total * 100).
+  // Cancela envios em andamento ao sair da página
   useEffect(() => {
-    if (!isUploading) return;
+    const active = xhrs.current;
+    return () => active.forEach((xhr) => xhr.abort());
+  }, []);
 
-    const timer = window.setInterval(() => {
-      setFiles((current) =>
-        current.map((item) => {
-          if (!item.uploading) return item;
-          const step = 100 / (6 + (item.file.size / 1024 / 1024) * 8);
-          const progress = Math.min(100, item.progress + step * (0.7 + Math.random() * 0.6));
-          const finished = progress >= 100;
-          return {
-            ...item,
-            progress,
-            uploading: !finished,
-            // Link de exemplo: troque pela URL retornada pelo seu backend.
-            url: finished
-              ? `${window.location.origin}/arquivos/${item.id}/${encodeURIComponent(item.file.name)}`
-              : item.url,
-          };
-        })
-      );
-    }, 250);
-
-    return () => window.clearInterval(timer);
-  }, [isUploading]);
+  function patch(id: string, changes: Partial<UploadFile>) {
+    setFiles((current) =>
+      current.map((item) => (item.id === id ? { ...item, ...changes } : item))
+    );
+  }
 
   function addFiles(fileList: FileList | null) {
     if (!fileList) return;
@@ -74,7 +70,8 @@ export function App() {
 
       if (!ACCEPTED_TYPES.includes(file.type)) error = "Formato não suportado";
       else if (file.size === 0) error = "O arquivo está vazio";
-      else if (file.size > MAX_FILE_SIZE) error = "O arquivo excede 10 MB";
+      else if (file.size > MAX_FILE_SIZE)
+        error = `O arquivo excede ${MAX_FILE_SIZE / 1024 / 1024} MB`;
 
       return {
         id: crypto.randomUUID(),
@@ -99,11 +96,81 @@ export function App() {
     addFiles(event.dataTransfer.files);
   }
 
+  function removeFile(id: string) {
+    xhrs.current.get(id)?.abort();
+    setFiles((current) => current.filter((item) => item.id !== id));
+  }
+
+  async function sendFile(item: UploadFile) {
+    patch(item.id, { uploading: true, failed: false, progress: 0 });
+
+    try {
+      // 1) pede a URL assinada e o id do upload ao backend
+      const res = await fetch(`${API_URL}/upload`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: item.file.name,
+          contentType: item.file.type,
+        }),
+      });
+      if (!res.ok) throw new Error("Falha ao criar o upload");
+
+      const { id: uploadId, signedUrl } = (await res.json()) as {
+        id: string;
+        signedUrl: string;
+      };
+
+      // 2) envia o arquivo direto para o R2, acompanhando o progresso
+      await new Promise<void>((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhrs.current.set(item.id, xhr);
+
+        xhr.open("PUT", signedUrl);
+        // precisa ser o mesmo `type` usado ao assinar a URL
+        xhr.setRequestHeader("Content-Type", item.file.type);
+
+        let last;
+        xhr.upload.onprogress = (event) => {
+          const now = performance.now();
+          if (!event.lengthComputable || now - last < 100) return;
+          last = now;
+          patch(item.id, {
+            progress: Math.min(99, (event.loaded / event.total) * 100),
+          });
+        };
+        xhr.onload = () =>
+          xhr.status >= 200 && xhr.status < 300
+            ? resolve()
+            : reject(new Error(`R2 respondeu ${xhr.status}`));
+        xhr.onerror = () => reject(new Error("Erro de rede"));
+        xhr.onabort = () => reject(new Error("Cancelado"));
+
+        xhr.send(item.file);
+      });
+
+      // 3) concluído: o link é a página de visualização, não a URL assinada
+      patch(item.id, {
+        progress: 100,
+        uploading: false,
+        url: `${window.location.origin}/${uploadId}`,
+      });
+    } catch {
+      patch(item.id, { uploading: false, failed: true, progress: 0 });
+    } finally {
+      xhrs.current.delete(item.id);
+    }
+  }
+
+  function startUpload() {
+    pending.filter((item) => !item.uploading).forEach(sendFile);
+  }
+
   async function copyLink(id: string, url: string) {
     try {
       await navigator.clipboard.writeText(url);
     } catch {
-      // Fallback para navegadores/contextos sem Clipboard API
+      // Fallback para contextos sem Clipboard API
       const textarea = document.createElement("textarea");
       textarea.value = url;
       textarea.style.position = "fixed";
@@ -120,25 +187,15 @@ export function App() {
     }, 2000);
   }
 
-  function removeFile(id: string) {
-    setFiles((current) => current.filter((item) => item.id !== id));
-  }
-
-  function startUpload() {
-    setFiles((current) =>
-      current.map((item) =>
-        item.error || item.progress >= 100 ? item : { ...item, uploading: true }
-      )
-    );
-  }
-
   return (
     <main className="grid min-h-screen place-items-center bg-zinc-950 px-5 py-10 font-sans text-zinc-100">
       <section className="w-full max-w-lg">
         <h1 className="text-2xl font-semibold tracking-tight text-white">
           Enviar arquivos
         </h1>
-        <p className="mt-1 text-sm text-zinc-500">PDF, PNG ou JPG · até 10 MB</p>
+        <p className="mt-1 text-sm text-zinc-500">
+          PDF, PNG, JPG ou MP4 · até {MAX_FILE_SIZE / 1024 / 1024} MB
+        </p>
 
         <div
           role="button"
@@ -167,7 +224,7 @@ export function App() {
             ref={inputRef}
             className="sr-only"
             type="file"
-            accept=".pdf,.png,.jpg,.jpeg"
+            accept=".pdf,.png,.jpg,.jpeg,.mp4"
             multiple
             onChange={handleInputChange}
           />
@@ -191,7 +248,7 @@ export function App() {
         {files.length > 0 && (
           <>
             <ul className="mt-6 divide-y divide-white/5">
-              {files.map(({ id, file, error, progress, uploading, url }) => {
+              {files.map(({ id, file, error, failed, progress, uploading, url }) => {
                 const pct = Math.floor(progress);
                 const done = progress >= 100;
 
@@ -202,10 +259,10 @@ export function App() {
                         <p className="truncate text-sm text-zinc-200">{file.name}</p>
                         <p
                           className={`mt-0.5 text-xs ${
-                            error ? "text-red-400" : "text-zinc-500"
+                            error || failed ? "text-red-400" : "text-zinc-500"
                           }`}
                         >
-                          {error || formatFileSize(file.size)}
+                          {error || (failed ? "Falha no envio" : formatFileSize(file.size))}
                         </p>
                       </div>
 
@@ -289,7 +346,9 @@ export function App() {
                 ? "Envio concluído"
                 : isUploading
                   ? `Enviando… ${percent}%`
-                  : `Enviar ${valid.length} ${valid.length === 1 ? "arquivo" : "arquivos"}`}
+                  : hasFailed
+                    ? "Tentar novamente"
+                    : `Enviar ${pending.length} ${pending.length === 1 ? "arquivo" : "arquivos"}`}
             </button>
           </>
         )}
